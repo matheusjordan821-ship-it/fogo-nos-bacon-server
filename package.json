@@ -1,13 +1,19 @@
 {
   "name": "fogo-nos-bacon-server",
   "version": "1.0.0",
-  "description": "Servidor multiplayer do Fogo Nos Bacon",
+  "private": true,
+  "description": "Servidor multiplayer do Fogo Nos Bacon — V1.0.0 Beta Pública (protocolo 2)",
   "main": "server.js",
+  "engines": { "node": ">=18" },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node tests/logic.test.js",
+    "test:live": "node tests/live.test.js"
   },
   "dependencies": {
-    "express": "^4.21.2",
     "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
   }
 }
