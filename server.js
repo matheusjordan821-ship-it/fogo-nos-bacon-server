@@ -1,5 +1,5 @@
 'use strict';
-/* Fogo Nos Bacon — servidor multiplayer V1.0.0 Beta Pública (protocolo 2)
+/* Fogo Nos Bacon — servidor multiplayer V1.0.5 Beta Pública (protocolo 2)
    Matchmaking 1v1, salas privadas, reconexão, amigos, chat, convites e esquadrões. */
 const http = require('http');
 const crypto = require('crypto');
@@ -8,7 +8,7 @@ const path = require('path');
 const { Server } = require('socket.io');
 const logger = require('./logger');   // logs de eventos (JSON)
 
-const VERSION = '1.0.0-beta-publica';
+const VERSION = '1.0.5-beta-publica';
 const PROTOCOL = 2;
 const PORT = process.env.PORT || 3000;
 const GRACE_MS = 15000;           // tempo para reconectar durante a partida
@@ -16,6 +16,9 @@ const INVITE_MS = 60000;
 const DATA_FILE = process.env.FNB_DATA_FILE || path.join(__dirname, 'data', 'social.json');
 const VERIFIED_NICKS = (process.env.VERIFIED_NICKS || 'VascainoBacon,VascainoBaconPC,RafaelMR').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const VERIFY_CODE = process.env.VERIFY_CODE || '';   // se vazio, ninguém é verificado online
+// Contas que podem dar Bacon Coins / Tokens (precisam estar verificadas: VERIFY_CODE definido no Render e digitado no jogo)
+const ADMIN_NICKS = (process.env.ADMIN_NICKS || 'vascainobacon,vascainobaconpc').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const MAX_GRANT = 10000000;
 
 const WEAPONS = {
   pistol: { damage: 20, range: 120, cooldown: 280 }, rifle: { damage: 20, range: 120, cooldown: 120 },
@@ -53,12 +56,14 @@ const squads = new Map();     // id -> { id, leader, members:Set }
 const invites = new Map();    // id -> convite
 const globalChat = [];
 const privateChat = new Map();// "a|b" -> [msgs]
+const grants = new Map();     // nick normalizado -> [{ id, kind:'tokens'|'gold', amount, from, ts }] (entregues até o jogador confirmar)
 
 const uid = n => crypto.randomBytes(n).toString('hex').toUpperCase();
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 function makeCode() { let c = ''; const b = crypto.randomBytes(6); for (let i = 0; i < 6; i++) c += CODE_CHARS[b[i] % CODE_CHARS.length]; return c; }
 const cleanName = v => String(v || 'Jogador').replace(/[<>\u0000-\u001f]/g, '').trim().slice(0, 18) || 'Jogador';
 const cleanText = v => String(v || '').replace(/[<>\u0000-\u001f]/g, '').trim().slice(0, 200);
+const normKey = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
 const validPid = v => typeof v === 'string' && /^P-[A-F0-9]{8,16}$/.test(v);
 const now = () => Date.now();
 
@@ -68,6 +73,7 @@ function loadData() {
   try {
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     for (const p of raw.profiles || []) profiles.set(p.pid, { pid: p.pid, name: p.name, friends: new Set(p.friends), incoming: new Set(p.incoming), outgoing: new Set(p.outgoing), sid: null, status: 'offline', verified: false, room: null, squad: null, lastChat: 0 });
+    for (const [k, list] of Object.entries(raw.grants || {})) if (Array.isArray(list) && list.length) grants.set(k, list);
   } catch (_) { /* primeira execução */ }
 }
 function saveData() {
@@ -76,6 +82,7 @@ function saveData() {
     try {
       fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
       const out = { profiles: [...profiles.values()].map(p => ({ pid: p.pid, name: p.name, friends: [...p.friends], incoming: [...p.incoming], outgoing: [...p.outgoing] })) };
+      out.grants = Object.fromEntries(grants);
       fs.writeFileSync(DATA_FILE, JSON.stringify(out));
     } catch (_) { /* ignora */ }
   }, 1500);
@@ -117,6 +124,18 @@ function limited(socket, key, ms) {
   const t = now(), k = '_rl_' + key;
   if (socket.data[k] && t - socket.data[k] < ms) return true;
   socket.data[k] = t; return false;
+}
+
+/* ---------- entregas do admin (Bacon Coins / Tokens) ---------- */
+const isAdmin = p => !!p && p.verified && ADMIN_NICKS.includes(normKey(p.name));
+function onlineSocketsOfKey(key) {
+  const out = [];
+  for (const pr of profiles.values()) if (pr.sid && normKey(pr.name) === key) { const s = sockOf(pr); if (s) out.push(s); }
+  return out;
+}
+function flushGrants(p) {
+  const list = grants.get(normKey(p.name)); const s = sockOf(p);
+  if (list && s) for (const g of list) s.emit('wallet:grant', g);
 }
 
 /* ---------- salas ---------- */
@@ -270,6 +289,32 @@ io.on('connection', socket => {
       io.to(r.code).emit('opponent:back', { pid }); }
   } else if (r) { socket.join(r.code); socket.data.room = r.code; }
   pushSocial(pid); pushFriendsOf(p);
+  flushGrants(p);   // entrega o que o admin mandou enquanto o jogador estava offline
+
+  /* --- admin: dar Bacon Coins / Tokens --- */
+  socket.on('admin:grant', (data, cb) => {
+    if (!isAdmin(p)) {
+      logger.warn('admin_grant_denied', { player: logger.hash(pid), name: p.name, verified: p.verified });
+      return reply(cb, { ok: false, message: p.verified ? 'Sua conta não é admin.' : 'Conta não verificada no servidor. Defina VERIFY_CODE no Render e digite o mesmo código no campo de verificação do jogo.' });
+    }
+    if (limited(socket, 'grant', 300)) return reply(cb, { ok: false, message: 'Devagar, tente de novo em um instante.' });
+    const kind = data && data.kind === 'gold' ? 'gold' : data && data.kind === 'tokens' ? 'tokens' : null;
+    const amount = Math.floor(Number(data && data.amount));
+    const target = normKey(data && data.target);
+    if (!kind || !target || !Number.isFinite(amount) || amount < 1 || amount > MAX_GRANT) return reply(cb, { ok: false, message: 'Dados inválidos (nick, tipo ou quantidade).' });
+    const g = { id: uid(6), kind, amount, from: p.name, ts: now() };
+    const list = grants.get(target) || []; list.push(g); if (list.length > 200) list.shift(); grants.set(target, list);
+    const socks = onlineSocketsOfKey(target); socks.forEach(s => s.emit('wallet:grant', g));
+    saveData();
+    logger.info('admin_grant', { admin: logger.hash(pid), target, kind, amount, delivered: socks.length > 0 });
+    reply(cb, { ok: true, delivered: socks.length > 0, message: socks.length ? 'Entregue agora.' : 'Jogador offline: será entregue quando ele conectar.' });
+  });
+  socket.on('grant:ack', data => {
+    const key = normKey(p.name), list = grants.get(key); if (!list || !data) return;
+    const left = list.filter(g => g.id !== data.id);
+    if (left.length) grants.set(key, left); else grants.delete(key);
+    saveData();
+  });
 
   /* --- fila --- */
   socket.on('queue:join', (data, cb) => {
@@ -300,190 +345,4 @@ io.on('connection', socket => {
     if (limited(socket, 'rc', 600)) return fail(socket, cb, 'room:error', 'Aguarde um instante e tente de novo.');
     dequeue(pid); if (p.room) leaveRoom(p, 'nova sala');
     const kind = MODES[data.mode] ? data.mode : 'duel';
-    const r2 = createRoom(kind, p); addToRoom(r2, p, socket, data); p.status = 'em sala';
-    logger.info('room_created', { player: logger.hash(pid), room: logger.hash(r2.code), mode: kind });
-    socket.emit('room:created', { code: r2.code, room: roomInfo(r2) });
-    reply(cb, { ok: true, code: r2.code }); broadcastRoom(r2); pushSocial(pid);
-  });
-  socket.on('room:join', (data, cb) => {
-    data = data || {};
-    const code = String(data.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
-    if (limited(socket, 'rj', 400)) return fail(socket, cb, 'room:error', 'Aguarde um instante e tente de novo.');
-    if (code.length < 4) return fail(socket, cb, 'room:error', 'Código de sala inválido.');
-    const r2 = rooms.get(code);
-    if (!r2 || !r2.private) return fail(socket, cb, 'room:error', 'Sala não encontrada. Confira o código.');
-    if (r2.started) return fail(socket, cb, 'room:error', 'A partida dessa sala já começou.');
-    if (r2.players.has(pid)) { reply(cb, { ok: true, code }); return broadcastRoom(r2); }
-    if (r2.players.size >= r2.cap) return fail(socket, cb, 'room:error', 'Essa sala está cheia.');
-    dequeue(pid); if (p.room) leaveRoom(p, 'trocou de sala');
-    addToRoom(r2, p, socket, data); p.status = 'em sala';
-    logger.info('room_joined', { player: logger.hash(pid), room: logger.hash(code) });
-    socket.emit('room:joined', { code, room: roomInfo(r2) });
-    reply(cb, { ok: true, code }); broadcastRoom(r2); pushMany([...r2.players.keys()]);
-  });
-  socket.on('room:start', cb => {
-    const r2 = p.room ? rooms.get(p.room) : null;
-    if (!r2 || !r2.private) return fail(socket, cb, 'room:error', 'Você não está em uma sala privada.');
-    if (r2.host !== pid) return fail(socket, cb, 'room:error', 'Só o dono da sala pode iniciar.');
-    if (r2.players.size < 2) return fail(socket, cb, 'room:error', 'Aguarde pelo menos mais um jogador.');
-    reply(cb, { ok: startRoom(r2) });
-  });
-  socket.on('room:leave', cb => { leaveRoom(p, 'saiu'); reply(cb, { ok: true }); });
-  socket.on('match:leave', () => leaveRoom(p, 'saiu'));
-
-  /* --- jogo --- */
-  socket.on('player:state', data => {
-    const r2 = p.room ? rooms.get(p.room) : null; if (!r2 || !r2.started || r2.ended) return;
-    const pl = r2.players.get(pid);
-    if (!pl || !data || ![data.x, data.z, data.yaw, data.pit].every(Number.isFinite)) return;
-    pl.x = Math.max(-145, Math.min(145, data.x)); pl.z = Math.max(-145, Math.min(145, data.z));
-    pl.yaw = data.yaw; pl.pit = Math.max(-1.4, Math.min(1.4, data.pit));
-    if (data.alive === false) pl.alive = false;
-    if (typeof data.skin === 'string') pl.skin = data.skin.slice(0, 24);
-    pl.stateAt = now();
-  });
-  socket.on('player:fire', data => {
-    const r2 = p.room ? rooms.get(p.room) : null; if (!r2 || !r2.started || r2.ended) return;
-    const shooter = r2.players.get(pid), weapon = WEAPONS[data && data.weapon];
-    if (!shooter || !shooter.alive || !weapon) return;
-    const t0 = now(); if (t0 - shooter.lastShot < weapon.cooldown * 0.72) return; shooter.lastShot = t0;
-    if (![data.x, data.y, data.z, data.dx, data.dy, data.dz].every(Number.isFinite)) return;
-    const len = Math.hypot(data.dx, data.dy, data.dz) || 1, dx = data.dx / len, dy = data.dy / len, dz = data.dz / len;
-    io.to(r2.code).emit('combat:shot', { id: pid, x: shooter.x, y: 1.4, z: shooter.z, dx, dy, dz });
-    let target = null, best = weapon.range;
-    for (const o of r2.players.values()) {
-      if (o.pid === pid || !o.alive || o.offline || (r2.teamSize > 1 && o.team === shooter.team)) continue;
-      const ox = o.x - data.x, oy = 1.0 - data.y, oz = o.z - data.z, t = ox * dx + oy * dy + oz * dz;
-      if (t < 0 || t > best) continue;
-      if (Math.hypot(ox - dx * t, oy - dy * t, oz - dz * t) < 0.9) { best = t; target = o; }
-    }
-    if (!target) return;
-    let rem = weapon.damage * (data.weapon === 'shotgun' || data.weapon === 'm870' ? 1.4 : 1);
-    if (target.armor > 0) { const a = Math.min(target.armor, rem * 0.5); target.armor -= a; rem -= a; }
-    target.hp = Math.max(0, target.hp - rem);
-    if (target.hp <= 0) { target.alive = false; shooter.kills++; }
-    io.to(r2.code).emit('combat:health', { attacker: pid, target: target.pid, hp: target.hp, armor: target.armor, kills: shooter.kills });
-    sendSnapshot(r2);
-    if (!target.alive) checkEnd(r2, pid);
-  });
-  const tick = setInterval(() => { const r2 = p.room ? rooms.get(p.room) : null; if (r2 && r2.started && !r2.ended) sendSnapshot(r2); }, 66);
-  socket.on('ping:fnb', cb => reply(cb, { t: now() }));
-
-  /* --- amizades --- */
-  socket.on('friend:add', (data, cb) => {
-    if (limited(socket, 'fa', 700)) return;
-    const t = findByNameOrId(data && data.target);
-    if (!t) return fail(socket, cb, 'social:error', 'Jogador não encontrado. Ele precisa ter entrado no servidor ao menos uma vez.');
-    if (t.pid === pid) return fail(socket, cb, 'social:error', 'Você não pode adicionar a si mesmo.');
-    if (p.friends.has(t.pid)) return fail(socket, cb, 'social:error', 'Vocês já são amigos.');
-    if (p.incoming.has(t.pid)) { // já havia pedido dele: aceita
-      p.incoming.delete(t.pid); t.outgoing.delete(pid); p.friends.add(t.pid); t.friends.add(pid);
-      logger.info('friend_added', { player: logger.hash(pid), friend: logger.hash(t.pid) });
-    } else { p.outgoing.add(t.pid); t.incoming.add(pid); emitTo(t.pid, 'friend:request', { from: pub(p) }); }
-    saveData(); reply(cb, { ok: true }); pushMany([pid, t.pid]);
-  });
-  socket.on('friend:accept', (data, cb) => {
-    const t = profiles.get(data && data.pid); if (!t || !p.incoming.has(t.pid)) return fail(socket, cb, 'social:error', 'Pedido não encontrado.');
-    p.incoming.delete(t.pid); t.outgoing.delete(pid); p.friends.add(t.pid); t.friends.add(pid);
-    logger.info('friend_added', { player: logger.hash(pid), friend: logger.hash(t.pid) });
-    saveData(); reply(cb, { ok: true }); pushMany([pid, t.pid]);
-  });
-  socket.on('friend:decline', (data, cb) => {
-    const t = profiles.get(data && data.pid); if (!t) return reply(cb, { ok: false });
-    p.incoming.delete(t.pid); t.outgoing.delete(pid); saveData(); reply(cb, { ok: true }); pushMany([pid, t.pid]);
-  });
-  socket.on('friend:remove', (data, cb) => {
-    const t = profiles.get(data && data.pid); if (!t) return reply(cb, { ok: false });
-    p.friends.delete(t.pid); t.friends.delete(pid); saveData(); reply(cb, { ok: true }); pushMany([pid, t.pid]);
-  });
-
-  /* --- chat --- */
-  socket.on('chat:global', (data, cb) => {
-    const text = cleanText(data && data.text); if (!text) return;
-    if (limited(socket, 'chat', 700)) return fail(socket, cb, 'social:error', 'Devagar! Aguarde um instante para enviar outra mensagem.');
-    const msg = { id: uid(3), from: pub(p), text, t: now() };
-    globalChat.push(msg); if (globalChat.length > 100) globalChat.shift();
-    io.emit('chat:global', msg); reply(cb, { ok: true });
-  });
-  socket.on('chat:private', (data, cb) => {
-    const t = profiles.get(data && data.to), text = cleanText(data && data.text); if (!text) return;
-    if (!t || !p.friends.has(t.pid)) return fail(socket, cb, 'social:error', 'Só é possível conversar em privado com amigos.');
-    if (limited(socket, 'pchat', 500)) return;
-    const msg = { id: uid(3), from: pub(p), to: t.pid, text, t: now() };
-    const key = [pid, t.pid].sort().join('|'); const arr = privateChat.get(key) || []; arr.push(msg); if (arr.length > 50) arr.shift(); privateChat.set(key, arr);
-    socket.emit('chat:private', msg); emitTo(t.pid, 'chat:private', msg); reply(cb, { ok: true });
-  });
-  socket.on('chat:history', (data, cb) => {
-    const key = [pid, String(data && data.with)].sort().join('|'); reply(cb, { ok: true, messages: privateChat.get(key) || [] });
-  });
-
-  /* --- convites e esquadrões --- */
-  function sendInvite(kind, toPid, cb) {
-    const t = profiles.get(toPid);
-    if (!t || !p.friends.has(toPid)) return fail(socket, cb, 'social:error', 'Convide apenas amigos.');
-    if (!t.sid) return fail(socket, cb, 'social:error', t.name + ' está offline.');
-    let code = null;
-    if (kind === 'match') {
-      let r2 = p.room ? rooms.get(p.room) : null;
-      if (!r2 || !r2.private || r2.started) { dequeue(pid); if (p.room) leaveRoom(p, 'convite'); r2 = createRoom('duel', p); addToRoom(r2, p, socket, {}); p.status = 'em sala'; socket.emit('room:created', { code: r2.code, room: roomInfo(r2) }); }
-      if (r2.players.size >= r2.cap) return fail(socket, cb, 'social:error', 'Sua sala está cheia.');
-      code = r2.code;
-    } else {
-      if (!p.squad) { const id = 'S-' + uid(3); squads.set(id, { id, leader: pid, members: new Set([pid]) }); p.squad = id; }
-      const sq = squads.get(p.squad);
-      if (sq.leader !== pid) return fail(socket, cb, 'social:error', 'Só o líder pode convidar.');
-      if (sq.members.size >= 4) return fail(socket, cb, 'social:error', 'Esquadrão cheio (máx. 4).');
-      if (t.squad === sq.id) return fail(socket, cb, 'social:error', 'Já está no esquadrão.');
-    }
-    const id = 'I-' + uid(4);
-    invites.set(id, { id, kind, from: pid, to: toPid, code, exp: now() + INVITE_MS });
-    emitTo(toPid, 'invite:received', { id, kind, from: pub(p), code });
-    reply(cb, { ok: true }); pushMany([pid, toPid]);
-  }
-  socket.on('invite:match', (d, cb) => sendInvite('match', d && d.to, cb));
-  socket.on('squad:invite', (d, cb) => sendInvite('squad', d && d.to, cb));
-  socket.on('invite:respond', (data, cb) => {
-    const inv = invites.get(data && data.id);
-    if (!inv || inv.to !== pid || inv.exp < now()) return fail(socket, cb, 'social:error', 'Convite expirado.');
-    invites.delete(inv.id);
-    if (!data.accept) { emitTo(inv.from, 'invite:declined', { by: pub(p), kind: inv.kind }); reply(cb, { ok: true }); return pushMany([pid, inv.from]); }
-    if (inv.kind === 'match') {
-      const r2 = rooms.get(inv.code);
-      if (!r2 || r2.started || r2.players.size >= r2.cap) return fail(socket, cb, 'room:error', 'A sala do convite não está mais disponível.');
-      dequeue(pid); if (p.room) leaveRoom(p, 'convite'); addToRoom(r2, p, socket, data); p.status = 'em sala';
-      socket.emit('room:joined', { code: r2.code, room: roomInfo(r2) }); broadcastRoom(r2);
-    } else {
-      const sq = (profiles.get(inv.from) || {}).squad ? squads.get(profiles.get(inv.from).squad) : null;
-      if (!sq || sq.members.size >= 4) return fail(socket, cb, 'social:error', 'O esquadrão não está mais disponível.');
-      if (p.squad) leaveSquad(p); sq.members.add(pid); p.squad = sq.id; pushMany([...sq.members]);
-    }
-    reply(cb, { ok: true }); pushMany([pid, inv.from]);
-  });
-  socket.on('squad:leave', cb => { leaveSquad(p); reply(cb, { ok: true }); });
-
-  /* --- desconexão --- */
-  socket.on('disconnect', () => {
-    clearInterval(tick);
-    if (socket.data.replaced) return;           // substituído por reconexão do mesmo jogador
-    dequeue(pid);
-    logger.info('player_disconnected', { player: logger.hash(pid), name: p.name, online_s: Math.round((now() - (socket.data.connectedAt || now())) / 1000) });
-    p.sid = null; p.status = 'offline';
-    const r2 = p.room ? rooms.get(p.room) : null;
-    if (r2 && r2.started && !r2.ended) {
-      const pl = r2.players.get(pid);
-      if (pl) {
-        pl.offline = true;
-        io.to(r2.code).emit('opponent:offline', { pid, name: p.name, graceMs: GRACE_MS });
-        pl.dropTimer = setTimeout(() => { if (profiles.get(pid) && !profiles.get(pid).sid) leaveRoom(p, 'desconectou'); }, GRACE_MS);
-        if (pl.dropTimer.unref) pl.dropTimer.unref();
-      }
-    } else if (r2) leaveRoom(p, 'desconectou');
-    leaveSquad(p);
-    pushFriendsOf(p);
-  });
-});
-
-if (require.main === module) {
-  server.listen(PORT, '0.0.0.0', () => { console.log('Fogo Nos Bacon — servidor ' + VERSION + ' (protocolo ' + PROTOCOL + ') na porta ' + PORT); logger.info('server_started', { version: VERSION, port: Number(PORT) }); });
-}
-module.exports = { server, io, rooms, queues, profiles, squads, PROTOCOL, VERSION };
+    const r2 = createRoom(kind, p); addToRoom(r2, p, socket, data); p.status = 'em
