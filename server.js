@@ -22,7 +22,7 @@ const MAX_GRANT = 10000000;
 
 const WEAPONS = {
   pistol: { damage: 20, range: 120, cooldown: 280 }, rifle: { damage: 20, range: 120, cooldown: 120 },
-  shotgun: { damage: 10, range: 38, cooldown: 850 }, ak47: { damage: 24, range: 90, cooldown: 130 },
+  shotgun: { damage: 90, range: 38, cooldown: 850 }, ak47: { damage: 24, range: 90, cooldown: 130 },
   m4a1: { damage: 20, range: 100, cooldown: 105 }, mp5: { damage: 13, range: 50, cooldown: 90 },
   ump45: { damage: 17, range: 55, cooldown: 110 }, deagle: { damage: 52, range: 70, cooldown: 420 },
   awm: { damage: 105, range: 200, cooldown: 1400 }, m870: { damage: 12, range: 30, cooldown: 900 }
